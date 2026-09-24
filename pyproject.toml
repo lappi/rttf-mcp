@@ -1,0 +1,32 @@
+[project]
+name = "rttf-mcp"
+version = "0.1.0"
+description = "MCP-сервер для рейтинга настольного тенниса rttf.ru"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=2.0",
+    "httpx>=0.28",
+    "beautifulsoup4>=4.12",
+    "soupsieve>=2.1",
+]
+
+[project.urls]
+Repository = "https://github.com/lappi/rttf-mcp"
+
+[project.scripts]
+rttf-mcp = "rttf_mcp.server:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["smoke: обращается к живому сайту, вручную"]
+addopts = "-m 'not smoke'"
