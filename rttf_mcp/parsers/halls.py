@@ -10,6 +10,7 @@ from bs4 import Tag
 from rttf_mcp.errors import ParseError
 from rttf_mcp.parsers.common import (
     extract_id,
+    parse_float,
     parse_int,
     raise_if_not_found,
     require,
@@ -90,5 +91,5 @@ def _rating(section: Tag | None) -> dict | None:
         cells = row.find_all("td")
         if len(cells) < 3:
             raise ParseError(PARSER, "section.hall-rating tr td ×3", f"найдено {len(cells)}")
-        aspects[text_of(require(cells[0].find("b"), "section.hall-rating td b", PARSER))] = float(text_of(cells[2]))
-    return {"overall": float(text_of(overall)), "aspects": aspects}
+        aspects[text_of(require(cells[0].find("b"), "section.hall-rating td b", PARSER))] = parse_float(text_of(cells[2]))
+    return {"overall": parse_float(text_of(overall)), "aspects": aspects}

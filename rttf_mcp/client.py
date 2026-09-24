@@ -2,14 +2,18 @@
 
 Клиент ничего не знает о разметке — он отдаёт текст, а разбирают его
 парсеры. Запросы последовательны: сайт отвечает за 1–3 секунды, и
-параллельные пачки ему ни к чему.
+параллельные пачки ему ни к чему. Последовательность обеспечивает
+блокировка в самом клиенте: SDK запускает синхронные инструменты в
+потоках, и параллельные вызовы модели иначе ушли бы на сайт разом.
 
-Каждый исходящий запрос — включая шаги перенаправления — сверяется с
-robots.txt (policy.blocking_rule) в хуке httpx до отправки. Закрытое не
-запрашивается ни в каком режиме, и отказ живёт в единственной точке
-выхода в сеть, а не на совести каждого инструмента.
+Каждый исходящий запрос — включая шаги перенаправления — сверяется в
+хуке httpx до отправки: хост должен быть хостом сайта, адрес — открыт
+robots.txt (policy.blocking_rule). Закрытое не запрашивается ни в каком
+режиме, и отказ живёт в единственной точке выхода в сеть, а не на
+совести каждого инструмента.
 """
 
+import threading
 from types import TracebackType
 
 import httpx
@@ -18,10 +22,17 @@ from rttf_mcp.errors import NotFound, PolicyViolation, UpstreamError
 from rttf_mcp.policy import blocking_rule
 
 
-def _guard(request: httpx.Request) -> None:
-    rule = blocking_rule(request.url.path, request.url.query.decode("ascii"))
-    if rule is not None:
-        raise PolicyViolation(str(request.url), rule)
+def _guard_for(host: str):
+    def guard(request: httpx.Request) -> None:
+        # Чужой хост — это чужой robots.txt, которого мы не читали, и чужая
+        # страница, которую модель приняла бы за данные rttf.ru.
+        if request.url.host != host:
+            raise PolicyViolation(str(request.url), f"хост не {host}")
+        rule = blocking_rule(request.url.path, request.url.query.decode("ascii"))
+        if rule is not None:
+            raise PolicyViolation(str(request.url), rule)
+
+    return guard
 
 
 class RttfClient:
@@ -36,16 +47,23 @@ class RttfClient:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._timeout = timeout
+        self._lock = threading.Lock()
         self._client = httpx.Client(
             base_url=base_url,
             timeout=timeout,
             headers={"User-Agent": self.USER_AGENT},
             transport=transport,
             follow_redirects=True,
-            event_hooks={"request": [_guard]},
+            event_hooks={"request": [_guard_for(httpx.URL(base_url).host)]},
         )
 
     def get_html(self, path: str, params: dict[str, str | list[str]] | None = None) -> str:
+        # Блокировка держится на весь запрос вместе с повтором: повтор тоже
+        # не должен обгонять чужой запрос.
+        with self._lock:
+            return self._get(path, params)
+
+    def _get(self, path: str, params: dict[str, str | list[str]] | None) -> str:
         # Полный адрес с параметрами: в сообщении об ошибке он нужен целиком,
         # иначе непонятно, какой именно запрос не прошёл.
         url = str(self._client.build_request("GET", path, params=params or {}).url)

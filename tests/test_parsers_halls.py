@@ -46,3 +46,9 @@ def test_not_found_page(load_fixture):
 def test_garbage_fails_loudly():
     with pytest.raises(ParseError):
         parse_hall("<html><body>ничего</body></html>", "1")
+
+
+def test_non_numeric_rating_is_a_parse_error(load_fixture):
+    html = load_fixture("hall_1073.html").replace("<td>4.1</td>", "<td>n/a</td>", 1)
+    with pytest.raises(ParseError):
+        parse_hall(html, "1073")

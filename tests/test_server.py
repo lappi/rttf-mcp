@@ -154,13 +154,6 @@ def test_get_player_matches_returns_the_category(stub, load_fixture):
     assert doubles["best_wins"] == []
 
 
-def test_get_player_matches_for_a_missing_category_is_empty_not_an_error(stub, load_fixture):
-    stub(load_fixture("player_226194.html"))
-    result = server.get_player_matches("226194", category="d")
-    assert result["tournaments"] == []
-    assert result["tournaments_truncated"] is False
-
-
 def test_head_to_head_finds_singles_meetings(stub, load_fixture):
     stub(load_fixture("player_28415.html"))
     result = server.get_head_to_head("28415", "199984")
@@ -282,3 +275,79 @@ def test_parse_error_names_the_selector_for_the_model(stub):
         server.get_player("28415")
     assert "ParseError" in str(excinfo.value)
     assert "section.player-info" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "tool,args",
+    [
+        ("list_players", {"max_rating": True}),
+        ("list_players", {"max_rating": "990"}),
+        ("list_players", {"max_rating": 990.0}),
+        ("list_players", {"max_rating": 0}),
+        ("list_players", {"city": "r77&name=x"}),
+        ("get_player", {"player_id": "28415\n"}),
+    ],
+)
+def test_invalid_input_is_refused_through_the_mcp_layer(stub, tool, args):
+    # Прямой вызов функции минует pydantic, который в нестрогом режиме
+    # превращал True в 1 и "990" в 990 раньше нашей проверки. Модель
+    # вызывает инструменты только так — через SDK.
+    client = stub()
+    manager = server.build_server(True)._tool_manager
+
+    async def run():
+        try:
+            await manager.call_tool(tool, args, None)
+        except Exception as exc:  # noqa: BLE001 — нас интересует сам объект
+            return exc
+        return None
+
+    error = asyncio.run(run())
+    assert error is not None
+    assert client.calls == []
+
+
+def test_missing_category_is_null_not_empty(stub, load_fixture):
+    # Пар у игрока 226194 нет вовсе. Пустой список значил бы «турниров в
+    # парах ноль» — это другое утверждение.
+    stub(load_fixture("player_226194.html"))
+    result = server.get_player_matches("226194", category="d")
+    assert result["tournaments"] is None
+    assert result["tournaments_truncated"] is None
+
+
+DOC_CASES = [
+    ("get_player", "player_28415.html", {"player_id": "28415"}),
+    ("get_player_matches", "player_28415.html", {"player_id": "28415"}),
+    ("get_head_to_head", "player_28415.html", {"player_id": "28415", "opponent_id": "199984"}),
+    ("get_tournament", "tournament_244471.html", {"tournament_id": "244471"}),
+    ("get_tournament", "tournament_243702.html", {"tournament_id": "243702"}),
+    ("list_players", "players_top.html", {}),
+    ("search_tournaments", "tournaments_hall_1073.html", {"hall_id": "1073"}),
+    ("get_hall", "hall_1073.html", {"hall_id": "1073"}),
+]
+
+
+def _keys(value, depth=0):
+    """Ключи ответа на двух верхних уровнях, включая первые элементы списков."""
+    found = set()
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            found.add(key)
+            # Ключи aspects — подписи сайта («Расположение»), а не схема ответа.
+            if depth < 2 and key != "aspects":
+                found |= _keys(inner, depth + 1)
+    elif isinstance(value, list) and value and depth < 3:
+        found |= _keys(value[0], depth)
+    return found
+
+
+@pytest.mark.parametrize("tool,fixture,args", DOC_CASES)
+def test_every_output_key_is_named_in_the_description(stub, load_fixture, tool, fixture, args):
+    # Докстринг — единственный канал к модели: поле, о котором он молчит,
+    # модель истолкует по имени, а имена здесь уже раз соврали.
+    stub(load_fixture(fixture))
+    result = getattr(server, tool)(**args)
+    description = listed(True)[tool]
+    missing = sorted(key for key in _keys(result) if key not in description)
+    assert missing == []

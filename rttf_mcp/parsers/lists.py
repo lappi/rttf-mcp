@@ -25,6 +25,7 @@ from rttf_mcp.parsers.common import (
 )
 
 PAGE_SIZE = 100
+MIN_WINDOW = 1
 
 _CITY = re.compile(r"cities\[\]=(\w+)")
 _DATE_ROW = re.compile(r"(\d{2}\.\d{2}\.\d{4})")
@@ -48,9 +49,12 @@ def parse_players_list(html: str, max_rating: int | None) -> dict:
         return {"players": players, "next_max_rating": None, "stalled_on_tie": False}
     next_max = min(p["rating"] for p in players) + 1
     stalled = max_rating is not None and next_max >= max_rating
+    # Окно ниже 1 сайт молча игнорирует и отдаёт вершину рейтинга (замерено),
+    # а инструмент такой курсор отвергает: дальше разрешёнными окнами не пройти.
+    below_floor = next_max < MIN_WINDOW
     return {
         "players": players,
-        "next_max_rating": None if stalled else next_max,
+        "next_max_rating": None if stalled or below_floor else next_max,
         "stalled_on_tie": stalled,
     }
 

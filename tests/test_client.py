@@ -141,3 +141,46 @@ def test_retry_succeeds_on_second_attempt():
     with make_client(handler) as client:
         assert client.get_html("/players/28415") == "получилось"
     assert len(calls) == 2
+
+
+def test_concurrent_calls_reach_the_site_one_at_a_time():
+    # SDK запускает синхронные инструменты в потоках, и модель часто вызывает
+    # несколько инструментов разом. Сайт должен видеть их по очереди.
+    import threading
+    import time
+
+    lock = threading.Lock()
+    state = {"active": 0, "peak": 0}
+
+    def handler(request):
+        with lock:
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+        time.sleep(0.05)
+        with lock:
+            state["active"] -= 1
+        return httpx.Response(200, text="ok")
+
+    with make_client(handler) as client:
+        threads = [threading.Thread(target=client.get_html, args=("/players/28415",)) for _ in range(5)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    assert state["peak"] == 1
+
+
+def test_redirect_to_another_host_is_refused():
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        if request.url.host == "rttf.ru":
+            return httpx.Response(302, headers={"Location": "https://other.example/anything"})
+        return httpx.Response(200, text="чужая страница")
+
+    with make_client(handler) as client:
+        with pytest.raises(PolicyViolation) as excinfo:
+            client.get_html("/players/28415")
+    assert calls == ["https://rttf.ru/players/28415"]
+    assert "other.example" in str(excinfo.value)

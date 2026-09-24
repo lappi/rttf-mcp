@@ -82,6 +82,18 @@ def parse_int(text: str) -> int:
     return int(match.group())
 
 
+def parse_float(text: str) -> float:
+    """Число с дробной частью целиком: '4.3' -> 4.3; иначе ParseError.
+
+    Голый float() на изменившейся вёрстке кинул бы ValueError, который до
+    модели доходит безликим «Error executing tool».
+    """
+    match = _NUMBER.fullmatch(_normalise_number(text))
+    if match is None:
+        raise ParseError("parse_float", "число", f"получено {text!r}")
+    return float(match.group())
+
+
 def parse_delta(text: str) -> float:
     """Изменение рейтинга: '+0.2' -> 0.2, '−18.8' -> -18.8, '' -> 0.0.
 

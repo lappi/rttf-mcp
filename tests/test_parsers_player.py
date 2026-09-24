@@ -279,3 +279,51 @@ def test_tab_without_its_section_fails_loudly(load_fixture):
     with pytest.raises(ParseError) as excinfo:
         parse_player(str(soup), "28415", include_matches=False)
     assert "section.rat_d" in str(excinfo.value)
+
+
+def test_absolute_tournament_links_still_parse(load_fixture):
+    soup = soup_of(load_fixture("player_28415.html"))
+    for a in soup.select('section.player-results > a[href^="tournaments/"]'):
+        a["href"] = "/" + a["href"]
+    profile = parse_player(str(soup), "28415", include_matches=False)
+    assert len(profile["categories"]["s"]["recent_tournaments"]) == 10
+
+
+def test_results_table_without_its_heading_fails_loudly(load_fixture):
+    # Таблиц результатов на странице десять, а разобрано меньше — это
+    # изменившаяся вёрстка, а не «турниров нет».
+    soup = soup_of(load_fixture("player_28415.html"))
+    soup.select_one('section.rat_s section.player-results > a[href^="tournaments/"]').decompose()
+    with pytest.raises(ParseError):
+        parse_player(str(soup), "28415", include_matches=False)
+
+
+def test_best_wins_rows_without_the_interval_class_fail_loudly(load_fixture):
+    soup = soup_of(load_fixture("player_28415.html"))
+    for row in soup.select("section.player-wins tbody tr"):
+        del row["class"]
+    with pytest.raises(ParseError):
+        parse_player(str(soup), "28415", include_matches=True)
+
+
+def test_missing_rating_chart_fails_loudly(load_fixture):
+    # Пропали и подписи, и значения: без проверки история молча стала бы [].
+    html = load_fixture("player_28415.html")
+    html = html.replace("chartAllData_s", "chartGoneData_s").replace("chartAllLabels_s", "chartGoneLabels_s")
+    with pytest.raises(ParseError):
+        parse_player(html, "28415", include_matches=False)
+
+
+def test_non_numeric_chart_value_is_a_parse_error(load_fixture):
+    html = load_fixture("player_28415.html")
+    assert "chartAllData_s = [300," in html
+    html = html.replace("chartAllData_s = [300,", "chartAllData_s = [null,")
+    with pytest.raises(ParseError):
+        parse_player(html, "28415", include_matches=False)
+
+
+def test_empty_tournament_heading_is_a_parse_error(load_fixture):
+    soup = soup_of(load_fixture("player_28415.html"))
+    soup.select_one('section.rat_s section.player-results > a[href^="tournaments/"]').clear()
+    with pytest.raises(ParseError):
+        parse_player(str(soup), "28415", include_matches=False)

@@ -47,6 +47,7 @@ KNOWN_CATEGORIES = {"s": "одиночный разряд", "d": "парный �
 
 _CHART = re.compile(r"chartAll(Labels|Data)_(\w)\s*=\s*(\[[^\]]*\])")
 _PLACE = re.compile(r"(\d+)\s*место")
+_SIGNED_INT = re.compile(r"-?\d+")
 _MAX = re.compile(r"\(([^)]*)\)")
 _HALL_COUNT = re.compile(r"турниров:\s*(\d+)")
 _EQUIPMENT = {"Основание": "blade", "Накладка справа": "rubber_right", "Накладка слева": "rubber_left"}
@@ -80,7 +81,12 @@ def parse_player(html: str, player_id: str, *, include_matches: bool) -> dict:
         raise ParseError(PARSER, "ul#tabs li[data-tab]", "у профиля нет ни одной категории рейтинга")
     profile["categories"] = categories
     if include_matches:
-        wins = soup.select("main.players > section.rat_s section.player-wins tbody tr.all")
+        rows = soup.select("main.players > section.rat_s section.player-wins tbody tr")
+        wins = [row for row in rows if "all" in (row.get("class") or [])]
+        # Строки есть, а «за всё время» среди них нет — сменились классы
+        # интервалов; пустой best_wins выглядел бы как «побед нет».
+        if rows and not wins:
+            raise ParseError(PARSER, "section.player-wins tbody tr.all", f"строк {len(rows)}, с классом all — 0")
         profile["best_wins"] = [_best_win(row) for row in wins]
     return profile
 
@@ -120,14 +126,22 @@ def _charts(html: str) -> dict[str, dict[str, list]]:
         if kind == "Labels":
             values: list = [item.strip('"') for item in items]
         else:
-            values = [int(item) for item in items]
+            values = [parse_int(item) if _SIGNED_INT.fullmatch(item) else _bad_chart(code, item) for item in items]
         charts.setdefault(code, {})[kind] = values
     return charts
 
 
-def _history(code: str, charts: dict) -> list[dict]:
+def _bad_chart(code: str, item: str):
+    raise ParseError(PARSER, f"chartAllData_{code}", f"не целое {item!r}")
+
+
+def _history(code: str, charts: dict, expected: bool) -> list[dict]:
     chart = charts.get(code)
     if chart is None:
+        # У категории с максимумом график на странице есть всегда (замерено
+        # на s и f); его пропажа — вёрстка, а не пустая история.
+        if expected:
+            raise ParseError(PARSER, f"chartAllLabels_{code} / chartAllData_{code}")
         return []
     labels, data = chart.get("Labels", []), chart.get("Data", [])
     if len(labels) != len(data):
@@ -156,7 +170,7 @@ def _category(code: str, tab: Tag, section: Tag, charts: dict, include_matches: 
     else:
         category["rating_max"] = None
         category["rating_max_date"] = None
-    category["rating_history"] = _history(code, charts)
+    category["rating_history"] = _history(code, charts, expected=maximum is not None)
 
     stats = section.select_one("section.player-stats")
     category["stats"] = _stats(stats) if stats is not None else None
@@ -215,17 +229,27 @@ def _results(section: Tag, *, doubles: bool, include_matches: bool) -> list[dict
     tournaments = []
     link: Tag | None = None
     participants: int | None = None
+    tables = 0
     for child in section.children:
         if not isinstance(child, Tag):
             continue
-        if child.name == "a" and child.get("href", "").startswith("tournaments/"):
+        if child.name == "a" and child.get("href", "").lstrip("/").startswith("tournaments/"):
             link, participants = child, None
         elif child.name == "kbd" and link is not None:
             participants = parse_int(text_of(child))
-        elif child.name == "table" and link is not None:
-            parse = _doubles_entry if doubles else _singles_entry
-            tournaments.append(parse(link, participants, child, include_matches))
-            link = None
+        elif child.name == "table":
+            tables += 1
+            if link is not None:
+                parse = _doubles_entry if doubles else _singles_entry
+                tournaments.append(parse(link, participants, child, include_matches))
+                link = None
+    # Таблица без ссылки-заголовка перед ней молча пропала бы, и список
+    # последних турниров укоротился бы правдоподобно — а это вёрстка.
+    if len(tournaments) != tables:
+        raise ParseError(
+            PARSER, "section.player-results > a[href*=tournaments/] + table",
+            f"таблиц {tables}, разобрано турниров {len(tournaments)}",
+        )
     return tournaments
 
 
@@ -235,6 +259,8 @@ def _heading(link: Tag) -> dict:
     limit = text_of(var) if var is not None else None
     before, _, after = clean(link.get_text(" ")).partition(limit or "\0")
     parts = before.split()
+    if not parts:
+        raise ParseError(PARSER, "a[href*=tournaments/] «ДД.ММ.ГГГГ ЧЧ:ММ»", f"получено {text_of(link)!r}")
     return {
         "tournament_id": extract_id(link["href"], "tournaments"),
         "date": parse_date(parts[0]),

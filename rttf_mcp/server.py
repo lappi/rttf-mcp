@@ -14,6 +14,10 @@ from importlib.metadata import version
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+# StrictInt: в нестрогом режиме pydantic превращал True в 1, а "990" и
+# 990.0 в 990 раньше проверки _valid_max_rating, и до сети уходил запрос,
+# которого модель не просила.
+from pydantic import StrictInt
 
 from rttf_mcp.client import RttfClient
 from rttf_mcp.errors import InvalidInput, RttfError
@@ -118,6 +122,12 @@ def get_player(player_id: str) -> dict:
     Выйти на игрока можно через list_players или через итоговую таблицу
     турнира (get_tournament).
 
+    Анкета: player_id, name (ФИО как на сайте), city (город со страной в
+    скобках, как на сайте), sports_rank (спортивный разряд, например "МС"),
+    playing_hand ("левая" | "правая") — каждое null, если игрок его не
+    указал. equipment — инвентарь: blade (основание), rubber_right и
+    rubber_left (накладки), каждое {item_id, name} или null.
+
     categories — словарь по коду категории; ключ есть, только если у игрока
     есть такая вкладка на сайте. Отсутствие ключа означает «категории у
     игрока нет», а не сбой. Замеренные коды:
@@ -183,14 +193,24 @@ def get_player_matches(player_id: str, category: str = "s") -> dict:
     RTTF_MCP_ALLOW_RESTRICTED. Данные берутся с разрешённой страницы
     профиля, закрытые адреса не запрашиваются.
 
-    category — "s" (одиночный разряд, по умолчанию) или "d" (пары).
+    category — "s" (одиночный разряд, по умолчанию) или "d" (пары). Ответ
+    повторяет player_id, name и category.
 
-    tournaments — не больше десяти последних турниров категории, каждый с
-    полями как в get_player и списком matches; более ранних матчей через
-    разрешённые адреса не достать. tournaments_truncated равно true, когда
-    турниров у игрока больше.
+    tournaments — не больше десяти последних турниров категории; более
+    ранних матчей через разрешённые адреса не достать.
+    tournaments_truncated равно true, когда турниров у игрока больше. Если
+    категории у игрока нет вовсе, оба поля равны null — это не «ноль
+    турниров».
 
-    Одиночный матч: opponent_id, opponent_rating_at_event — рейтинг
+    Турнир: tournament_id, date, start_time, limit, hall_name, participants
+    (число участников), place (null, если сайт не указал), wins/losses,
+    duration_minutes_total (сумма длительностей или null), matches. У
+    одиночного ещё rating_before_event, rating_after_event, rating_delta,
+    bonus — как в get_player; у парного — pair (игрок и партнёр:
+    player_id, name, rating_at_event — одиночный рейтинг на момент
+    турнира) и pair_rating_at_event (их сумма).
+
+    Одиночный матч: opponent_id, opponent_name, opponent_rating_at_event — рейтинг
     соперника ДО этого турнира (проверено по итоговой таблице турнира; это
     не сегодняшний рейтинг), score_for/score_against, result "win" |
     "loss" | "unparsed" (неопознанный счёт — признак изменившейся вёрстки,
@@ -199,14 +219,18 @@ def get_player_matches(player_id: str, category: str = "s") -> dict:
     start_time и stage — время начала и стадия («гр. 1», «1/8», «фин»,
     «кл. 4» и т. п., свободный текст сайта) или null.
 
-    Парный матч: opponents — два соперника с одиночными рейтингами на
-    момент турнира, opponents_pair_rating_at_event — их сумма. Дельты за
-    парный матч сайт не публикует, поля rating_delta нет.
+    Парный матч: opponents — два соперника (player_id, name,
+    rating_at_event — одиночный рейтинг на момент турнира),
+    opponents_pair_rating_at_event — их сумма; счёт, result, start_time,
+    stage и duration_minutes — как у одиночного. Дельты за парный матч
+    сайт не публикует, поля rating_delta нет.
 
     best_wins — десять лучших побед за всё время (только для "s", для "d"
     — пустой список): это единственный путь к матчам старше последних
-    десяти турниров. player_rating_at_event и opponent_rating_at_event —
-    рейтинги на момент той встречи.
+    десяти турниров. Поля: tournament_id, date, limit, hall_name,
+    player_rating_at_event и opponent_rating_at_event — рейтинги на момент
+    той встречи, opponent_id, opponent_name, счёт, result, rating_delta,
+    duration_minutes.
     """
     if category not in MATCH_CATEGORIES:
         raise InvalidInput(f"category должна быть одной из {list(MATCH_CATEGORIES)}; получено {category!r}")
@@ -216,8 +240,8 @@ def get_player_matches(player_id: str, category: str = "s") -> dict:
         "player_id": profile["player_id"],
         "name": profile["name"],
         "category": category,
-        "tournaments": section["recent_tournaments"] if section else [],
-        "tournaments_truncated": section["recent_tournaments_truncated"] if section else False,
+        "tournaments": section["recent_tournaments"] if section else None,
+        "tournaments_truncated": section["recent_tournaments_truncated"] if section else None,
         "best_wins": profile["best_wins"] if category == "s" else [],
     }
 
@@ -234,11 +258,17 @@ def get_head_to_head(player_id: str, opponent_id: str) -> dict:
     просматриваются только последние турниры игрока (не больше десяти по
     каждой категории) и десять его лучших побед. Пустые списки означают
     «в этих турнирах не встречались», а не «не встречались никогда».
-    coverage показывает, сколько турниров просмотрено и есть ли более
-    ранние.
+    coverage показывает охват: singles и doubles — {tournaments_checked:
+    сколько турниров просмотрено, truncated: есть ли у игрока более ранние}
+    или null, если такой категории у игрока нет вовсе; best_wins_checked —
+    сколько лучших побед просмотрено.
 
-    singles — одиночные матчи, doubles — парные, где соперник был в
-    противоположной паре; поля матчей как в get_player_matches, плюс
+    Ответ повторяет player_id и opponent_id. singles — одиночные матчи
+    (opponent_id, opponent_name, opponent_rating_at_event, score_for,
+    score_against, score_raw, result, rating_delta, duration_minutes,
+    start_time, stage — как в get_player_matches); doubles — парные, где
+    соперник был в противоположной паре (opponents с player_id, name,
+    rating_at_event; opponents_pair_rating_at_event). У каждой встречи ещё
     tournament_id, date и hall_name турнира. best_wins — победы над
     соперником из лучших побед, не вошедшие в singles.
     """
@@ -253,10 +283,14 @@ def get_head_to_head(player_id: str, opponent_id: str) -> dict:
     for code in MATCH_CATEGORIES:
         section = profile["categories"].get(code)
         tournaments = section["recent_tournaments"] if section else []
-        coverage[code] = {
-            "tournaments_checked": len(tournaments),
-            "truncated": bool(section and section["recent_tournaments_truncated"]),
-        }
+        coverage[code] = (
+            {
+                "tournaments_checked": len(tournaments),
+                "truncated": section["recent_tournaments_truncated"],
+            }
+            if section
+            else None
+        )
         for entry in tournaments:
             for match in entry["matches"]:
                 if code == "s":
@@ -291,10 +325,16 @@ def get_tournament(tournament_id: str) -> dict:
     нет вовсе (этапы выложены картинками), а список игр лежит в закрытом
     /games.
 
-    limit — ограничение по рейтингу как на сайте: число, "отк" (открытый)
-    или "дети". doubles — парный ли турнир. has_results — сыгран ли
-    турнир; у несыгранного standings пуст, а participants, games,
-    average_rating и coefficient равны null.
+    Метаданные: tournament_id, title, date, start_time, hall ({hall_id,
+    name} или null), address. limit — ограничение по рейтингу как на
+    сайте: число, "отк" (открытый) или "дети". doubles — парный ли турнир.
+    has_results — сыгран ли турнир; у несыгранного standings пуст, а
+    счётчики, average_rating и coefficient равны null.
+
+    Счётчики сыгранного турнира зависят от вида: у одиночного —
+    participants (участников) и games (встреч), а pairs и players равны
+    null; у парного — pairs (пар), players (игроков) и games, а
+    participants равно null.
 
     registered / registration_limit — сколько заявилось и лимит заявок
     (null, если лимита нет). У парного турнира сайт считает заявки
@@ -320,7 +360,7 @@ def get_tournament(tournament_id: str) -> dict:
 
 
 @_reporting
-def list_players(city: str = "", max_rating: int | None = None) -> dict:
+def list_players(city: str = "", max_rating: StrictInt | None = None) -> dict:
     """Листает рейтинг игроков rttf.ru окнами по сто строк. Один запрос.
 
     Это единственный разрешённый способ выйти на игрока без поиска по
@@ -338,12 +378,16 @@ def list_players(city: str = "", max_rating: int | None = None) -> dict:
     а показывает округлённый, и без перекрытия часть игроков выпадала бы.
     Повторы между окнами отбрасывайте по player_id.
 
-    next_max_rating равно null, когда список кончился (строк меньше ста)
-    или когда stalled_on_tie равно true: сто строк окна имеют один и тот же
-    рейтинг, и дальше окнами не пройти — остальные игроки с этим рейтингом
-    через разрешённые адреса недоступны. Игроки с рейтингом ниже 1 тоже
-    недоступны: такое окно сайт молча игнорирует.
+    Ответ повторяет city и max_rating запроса. next_max_rating равно null
+    в трёх случаях: список кончился (строк меньше ста); stalled_on_tie
+    равно true — следующее окно не уже текущего, потому что сто строк
+    уместились в один-два соседних показанных рейтинга, и дальше окнами не
+    пройти, остальные игроки с этими рейтингами через разрешённые адреса
+    недоступны; или окно дошло до рейтинга ниже 1 — такое окно сайт молча
+    игнорирует, и эти игроки тоже недоступны.
 
+    players — строки окна: rank, player_id, name, is_team, city
+    ({city_id, name} или null), rating, updated.
     rank — место в ОБЩЕМ рейтинге, даже при фильтре по городу. is_team —
     корпоративная команда, а не человек: сайт ставит их в общий рейтинг
     наравне с игроками. city равно null, если город не указан. updated —
@@ -375,9 +419,11 @@ def search_tournaments(city: str = "", hall_id: str = "", tournament_type: str =
     каждом списке не больше ста строк, листания нет (подгрузка на сайте
     идёт через закрытый адрес). Без фильтров сто прошедших покрывают
     примерно полтора дня; с фильтром по залу — несколько недель.
-    *_total — счётчик «итого» сайта, если он показан (в коротких
-    отфильтрованных списках), иначе null. *_truncated равно true, когда
-    строк на сайте больше, чем в ответе.
+    upcoming_total и past_total — счётчик «итого» сайта, если он показан
+    (в коротких отфильтрованных списках), иначе null. upcoming_truncated и
+    past_truncated равны true, когда строк на сайте больше, чем в ответе.
+    filters повторяет применённые фильтры (city, hall_id,
+    tournament_type); пустые не включаются.
 
     Строка: tournament_id, date, start_time, limit, hall_name (краткое имя
     зала), doubles, ladder (лесенка), live (идёт сейчас), registration_open,
@@ -385,19 +431,20 @@ def search_tournaments(city: str = "", hall_id: str = "", tournament_type: str =
     registration_limit, games (сыграно встреч или null).
     """
     params: dict[str, str] = {}
+    filters: dict[str, str] = {}
     city_code = _valid_city(city)
     if city_code is not None:
-        params["cities[]"] = city_code
+        params["cities[]"] = filters["city"] = city_code
     if hall_id:
-        params["halls[]"] = _valid_id(hall_id, "hall_id")
+        params["halls[]"] = filters["hall_id"] = _valid_id(hall_id, "hall_id")
     if tournament_type:
         if tournament_type not in TOURNAMENT_TYPES:
             raise InvalidInput(
                 f"tournament_type должен быть одним из {sorted(TOURNAMENT_TYPES)}; получено {tournament_type!r}"
             )
-        params["types[]"] = tournament_type
+        params["types[]"] = filters["tournament_type"] = tournament_type
     html = _client.get_html("/tournaments/", params)
-    return {"filters": params} | parse_tournaments_list(html)
+    return {"filters": filters} | parse_tournaments_list(html)
 
 
 @_reporting
@@ -408,11 +455,13 @@ def get_hall(hall_id: str) -> dict:
     get_tournament (hall.hall_id) и в сводке игрока
     (stats.most_frequent_hall.hall_id).
 
-    Поля: name, address, metro (список станций или null), opening_hours,
-    tables — число столов, website, amenities и paid_amenities — удобства,
-    бесплатные и платные, rating — оценка посетителей (overall и по
-    аспектам) или null, representative_player_id — профиль представителя
-    зала на сайте. Любое поле может быть null, если зал его не заполнил.
+    Поля: hall_id, name, address, metro (список станций или null),
+    opening_hours, tables — число столов, website,
+    representative_player_id — профиль представителя зала на сайте;
+    каждое из них null, если зал его не заполнил. amenities и
+    paid_amenities — удобства, бесплатные и платные: списки, пустые, если
+    значков нет. rating — оценка посетителей или null: overall и aspects
+    (словарь «аспект как на сайте» -> оценка).
 
     Контакты зала не отдаются намеренно: там личные телефоны сотрудников.
     Турниры зала — search_tournaments(hall_id=...).

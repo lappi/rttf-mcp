@@ -131,3 +131,14 @@ def test_unknown_row_shape_fails_loudly(load_fixture):
     table.append(soup_of("<tr><td>что-то новое</td></tr>").tr)
     with pytest.raises(ParseError):
         parse_tournaments_list(str(soup))
+
+
+def test_cursor_never_goes_below_the_window_floor(load_fixture):
+    # Полное окно, в котором встретился рейтинг ниже 1 (новичок после
+    # неудачного турнира, фильтр по городу): курсор ≤ 0 инструмент сам же
+    # отверг бы, а сайт на rat_to ≤ 0 отдаёт вершину. Честный ответ — конец.
+    soup = soup_of(load_fixture("players_window_990.html"))
+    soup.select("section.players-list > table tr dfn")[-1].string = "-3"
+    result = parse_players_list(str(soup), 990)
+    assert result["next_max_rating"] is None
+    assert result["stalled_on_tie"] is False
