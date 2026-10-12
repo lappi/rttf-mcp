@@ -70,7 +70,7 @@ def canary(monkeypatch, load_fixture):
             raise AssertionError(f"закрытый адрес запрошен: {url}")
         return httpx.Response(200, text=load_fixture(ROUTES[path]))
 
-    monkeypatch.setattr(server, "_client", RttfClient(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(server, "_client", RttfClient(transport=httpx.MockTransport(handler), min_interval=0.0))
     return seen
 
 

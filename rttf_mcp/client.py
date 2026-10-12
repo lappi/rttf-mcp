@@ -1,10 +1,12 @@
 """HTTP-доступ к rttf.ru.
 
 Клиент ничего не знает о разметке — он отдаёт текст, а разбирают его
-парсеры. Запросы последовательны: сайт отвечает за 1–3 секунды, и
-параллельные пачки ему ни к чему. Последовательность обеспечивает
-блокировка в самом клиенте: SDK запускает синхронные инструменты в
-потоках, и параллельные вызовы модели иначе ушли бы на сайт разом.
+парсеры. Запросы последовательны и разнесены во времени: между концом
+одного обращения к сайту и началом следующего не меньше MIN_INTERVAL
+секунд. Последовательность обеспечивает блокировка в самом клиенте: SDK
+запускает синхронные инструменты в потоках, и параллельные вызовы модели
+иначе ушли бы на сайт разом. Паузу держит та же блокировка: модель
+вызывает инструменты подряд, и без паузы сайт видит пачку.
 
 Каждый исходящий запрос — включая шаги перенаправления — сверяется в
 хуке httpx до отправки: хост должен быть хостом сайта, адрес — открыт
@@ -14,6 +16,8 @@ robots.txt (policy.blocking_rule). Закрытое не запрашивает�
 """
 
 import threading
+import time
+from collections.abc import Callable
 from types import TracebackType
 
 import httpx
@@ -39,14 +43,26 @@ class RttfClient:
     BASE_URL = "https://rttf.ru"
     USER_AGENT = "rttf-mcp/0.1 (+https://github.com/lappi/rttf-mcp)"
     TIMEOUT = 30.0
+    # Пауза между концом одного обращения к сайту и началом следующего, как
+    # в scripts/fetch_fixtures.py. Каждый инструмент делает один запрос, но
+    # модель вызывает инструменты подряд: без паузы девять вызовов ушли на
+    # сайт за секунды, и он перестал принимать соединения (2026-10-12).
+    MIN_INTERVAL = 2.0
 
     def __init__(
         self,
         base_url: str = BASE_URL,
         timeout: float = TIMEOUT,
         transport: httpx.BaseTransport | None = None,
+        min_interval: float = MIN_INTERVAL,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._timeout = timeout
+        self._min_interval = min_interval
+        self._clock = clock
+        self._sleep = sleep
+        self._last_request: float | None = None
         self._lock = threading.Lock()
         self._client = httpx.Client(
             base_url=base_url,
@@ -70,7 +86,7 @@ class RttfClient:
         last: Exception | None = None
         for _ in range(2):  # один повтор, только на сетевую ошибку
             try:
-                response = self._client.get(path, params=params or {})
+                response = self._spaced_get(path, params)
             except httpx.TransportError as exc:
                 last = exc
                 continue
@@ -89,6 +105,19 @@ class RttfClient:
         raise UpstreamError(
             url, f"{type(last).__name__}: {last} — две попытки, таймаут {self._timeout} с"
         )
+
+    def _spaced_get(self, path: str, params: dict[str, str | list[str]] | None) -> httpx.Response:
+        """Одно обращение к сайту не раньше чем через MIN_INTERVAL после конца
+        предыдущего. Отсчёт идёт от любого исхода — ответа, отказа или
+        сетевой ошибки: каждый из них был обращением к сайту."""
+        if self._last_request is not None:
+            wait = self._last_request + self._min_interval - self._clock()
+            if wait > 0:
+                self._sleep(wait)
+        try:
+            return self._client.get(path, params=params or {})
+        finally:
+            self._last_request = self._clock()
 
     def close(self) -> None:
         self._client.close()

@@ -5,8 +5,26 @@ from rttf_mcp.client import RttfClient
 from rttf_mcp.errors import NotFound, PolicyViolation, UpstreamError
 
 
-def make_client(handler) -> RttfClient:
-    return RttfClient(transport=httpx.MockTransport(handler))
+def make_client(handler, **kwargs) -> RttfClient:
+    # Интервал между запросами по умолчанию выключен: тесты ниже проверяют
+    # другое и не должны спать. Сам интервал проверяется с поддельными часами.
+    kwargs.setdefault("min_interval", 0.0)
+    return RttfClient(transport=httpx.MockTransport(handler), **kwargs)
+
+
+class FakeTime:
+    """Часы и sleep без настоящего ожидания: sleep двигает часы вперёд."""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+        self.sleeps: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
 
 
 def test_get_html_returns_body():
@@ -184,3 +202,77 @@ def test_redirect_to_another_host_is_refused():
             client.get_html("/players/28415")
     assert calls == ["https://rttf.ru/players/28415"]
     assert "other.example" in str(excinfo.value)
+
+
+def spaced_client(handler, fake: FakeTime) -> RttfClient:
+    return make_client(handler, min_interval=2.0, clock=fake.clock, sleep=fake.sleep)
+
+
+def test_default_interval_is_two_seconds():
+    # Спека, §5: клиент — копия ttw-mcp «с правкой пауз». Без паузы девять
+    # вызовов модели подряд ушли на сайт за секунды, и сайт перестал
+    # принимать соединения с этого адреса (2026-10-12).
+    assert RttfClient.MIN_INTERVAL == 2.0
+
+
+def test_first_request_does_not_wait():
+    fake = FakeTime()
+    with spaced_client(lambda request: httpx.Response(200, text="ok"), fake) as client:
+        client.get_html("/players/28415")
+    assert fake.sleeps == []
+
+
+def test_back_to_back_requests_are_spaced_from_the_end_of_the_previous_one():
+    fake = FakeTime()
+
+    def handler(request):
+        fake.now += 0.3  # сайт отвечает 0.3 с
+        return httpx.Response(200, text="ok")
+
+    with spaced_client(handler, fake) as client:
+        client.get_html("/players/28415")
+        client.get_html("/tournaments/243702")
+    assert fake.sleeps == [pytest.approx(2.0)]
+
+
+def test_no_wait_when_the_interval_has_already_passed():
+    fake = FakeTime()
+    with spaced_client(lambda request: httpx.Response(200, text="ok"), fake) as client:
+        client.get_html("/players/28415")
+        fake.now += 5.0  # модель думала пять секунд
+        client.get_html("/players/28415")
+    assert fake.sleeps == []
+
+
+def test_retry_also_waits_the_interval():
+    fake = FakeTime()
+    calls = []
+
+    def handler(request):
+        calls.append(fake.now)
+        fake.now += 0.1
+        if len(calls) == 1:
+            raise httpx.ConnectTimeout("нет связи")
+        return httpx.Response(200, text="ok")
+
+    with spaced_client(handler, fake) as client:
+        assert client.get_html("/players/28415") == "ok"
+    assert fake.sleeps == [pytest.approx(2.0)]
+    assert calls[1] - calls[0] == pytest.approx(2.1)
+
+
+def test_a_refused_request_still_counts_for_the_interval():
+    # Отказ сайта — тоже обращение к нему; следующий запрос ждёт так же.
+    fake = FakeTime()
+
+    def handler(request):
+        fake.now += 0.1
+        return httpx.Response(500, text="boom")
+
+    with spaced_client(handler, fake) as client:
+        with pytest.raises(UpstreamError):
+            client.get_html("/players/28415")
+        with pytest.raises(UpstreamError):
+            client.get_html("/players/28415")
+    assert fake.sleeps == [pytest.approx(2.0)]
+
